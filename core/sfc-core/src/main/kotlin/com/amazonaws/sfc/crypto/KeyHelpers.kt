@@ -1,4 +1,3 @@
-
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -9,7 +8,6 @@ package com.amazonaws.sfc.crypto
 
 import com.amazonaws.sfc.util.constrainFilePermissions
 import org.bouncycastle.openssl.jcajce.JcaPEMWriter
-import sun.security.rsa.RSAPrivateCrtKeyImpl
 import java.io.File
 import java.io.FileWriter
 import java.io.IOException
@@ -255,7 +253,7 @@ import java.util.*
         constrainFilePermissions(file)
     }
 
-    val RSAPrivateCrtKeyImpl.asPKCS8: ByteArray
+    val RSAPrivateCrtKey.asPKCS8: ByteArray
         get() {
             val keyFactory = KeyFactory.getInstance(this.algorithm)
             val privateKeySpec = keyFactory.getKeySpec(this, PKCS8EncodedKeySpec::class.java)
@@ -267,5 +265,3 @@ import java.util.*
             return s.toByteArray()
         }
 
-
-}
