@@ -43,11 +43,13 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.selects.select
 import org.apache.iceberg.DataFile
-import org.apache.iceberg.PartitionData
+import org.apache.iceberg.PartitionKey
 import org.apache.iceberg.PartitionSpec
+import org.apache.iceberg.StructLike
 import org.apache.iceberg.Table
 import org.apache.iceberg.catalog.TableIdentifier
 import org.apache.iceberg.data.GenericRecord
+import org.apache.iceberg.data.InternalRecordWrapper
 import org.apache.iceberg.data.Record
 import org.apache.iceberg.data.parquet.GenericParquetWriter
 import org.apache.iceberg.io.DataWriter
@@ -56,14 +58,10 @@ import org.apache.iceberg.types.Type
 import software.amazon.awssdk.auth.credentials.AwsCredentials
 import software.amazon.awssdk.auth.credentials.AwsSessionCredentials
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider
-import java.time.LocalDate
-import java.time.LocalDateTime
-import java.time.OffsetDateTime
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
-import kotlin.math.abs
 import kotlin.time.Duration
 import kotlin.time.DurationUnit
 import kotlin.time.measureTime
@@ -165,8 +163,6 @@ class AwsS3TablesTargetWriter(
         if (config == null) {
             log.info("Using default AWS credentials provider")
             DefaultCredentialsProvider.create()
-            // The default provider has no worker to signal readiness, so signal it here
-            credentialsAvailableChannel.trySend(true)
         } else {
             log.info("Using SFC credential provider client ${targetConfiguration.credentialProviderClient}")
             AwsIoTCredentialSessionProvider(credentialClientConfig, logger)
@@ -398,6 +394,7 @@ class AwsS3TablesTargetWriter(
 
         val log = logger.getCtxLoggers(className, "build")
 
+        val missingValues = mutableListOf<String>()
         val targetDataMap = targetData.toMap(writerConfiguration.elementNames, true)
 
         val recordsData = sequence {
@@ -406,8 +403,6 @@ class AwsS3TablesTargetWriter(
             table.mappings.forEachIndexed { tableMappingIndex, tableMapping: Map<String, ColumnMappingConfiguration> ->
 
                 val filteredByValueFilter = mutableListOf<Pair<String, Any>>()
-                val missingValues = mutableListOf<String>()
-                
                 // get thet data for a record for each tableMapping
                 val mappedRecordData = sequence {
 
@@ -650,7 +645,7 @@ class AwsS3TablesTargetWriter(
     private fun writeRecords(
         catalogTable: Table,
         records: List<GenericRecord>,
-        partitionData: PartitionData? = null): Int {
+        partitionData: StructLike? = null): Int {
 
         if (records.isEmpty()) return 0
 
@@ -675,92 +670,19 @@ class AwsS3TablesTargetWriter(
 
     }
 
-    fun buildPartitionData(record: Record, table: Table): PartitionData {
-        val spec: PartitionSpec = table.spec()
+    // Partition values are computed by Iceberg's own PartitionKey so every transform
+    // (identity, year, month, day, hour, bucket, truncate) matches the Iceberg spec.
+    // InternalRecordWrapper converts date/time values in the record to Iceberg's
+    // internal representation before the transforms are applied.
+    fun buildPartitionData(record: Record, table: Table): PartitionKey {
         val schema = table.schema()
-        val partitionData = PartitionData(spec.partitionType())
-
-        spec.fields().forEachIndexed { index, field ->
-            val sourceId = field.sourceId()
-            val source = schema.findField(sourceId)
-            val sourceValue = record.getField(source.name())
-
-            val transform = PartitionTransform.of(field.transform().toString(), source.name())
-
-            when (transform) {
-                PartitionTransform.IDENTITY -> partitionData.set(index, sourceValue)
-
-                PartitionTransform.YEAR -> {
-                    when (sourceValue) {
-                        is Int -> partitionData.set(index, sourceValue)
-                        is Long -> partitionData.set(index, sourceValue.toInt())
-                        is Float -> partitionData.set(index, sourceValue.toInt())
-                        is Double -> partitionData.set(index, sourceValue.toInt())
-                        is LocalDate -> partitionData.set(index, sourceValue.year)
-                        is OffsetDateTime -> partitionData.set(index, sourceValue.year)
-                        is LocalDateTime -> partitionData.set(index, sourceValue.year)
-                    }
-                }
-
-                PartitionTransform.MONTH -> {
-                    when (sourceValue) {
-                        is Int -> partitionData.set(index, sourceValue)
-                        is Long -> partitionData.set(index, sourceValue.toInt())
-                        is Float -> partitionData.set(index, sourceValue.toInt())
-                        is Double -> partitionData.set(index, sourceValue.toInt())
-                        is LocalDate -> partitionData.set(index, sourceValue.monthValue)
-                        is OffsetDateTime -> partitionData.set(index, sourceValue.monthValue)
-                        is LocalDateTime -> partitionData.set(index, sourceValue.monthValue)
-
-                    }
-                }
-
-                PartitionTransform.DAY -> {
-                    when (sourceValue) {
-                        is Int -> partitionData.set(index, sourceValue)
-                        is Long -> partitionData.set(index, sourceValue.toInt())
-                        is Float -> partitionData.set(index, sourceValue.toInt())
-                        is Double -> partitionData.set(index, sourceValue.toInt())
-                        is LocalDate -> partitionData.set(index, sourceValue.dayOfMonth)
-                        is OffsetDateTime -> partitionData.set(index, sourceValue.dayOfMonth)
-                        is LocalDateTime -> partitionData.set(index, sourceValue.dayOfMonth)
-                    }
-                }
-
-                PartitionTransform.HOUR -> {
-                    when (sourceValue) {
-                        is Int -> partitionData.set(index, sourceValue)
-                        is Long -> partitionData.set(index, sourceValue.toInt())
-                        is Float -> partitionData.set(index, sourceValue.toInt())
-                        is Double -> partitionData.set(index, sourceValue.toInt())
-                        is OffsetDateTime -> partitionData.set(index, sourceValue.hour)
-                        is LocalDateTime -> {
-                            partitionData.set(index, sourceValue.hour)
-                        }
-                    }
-                }
-
-                PartitionTransform.BUCKET -> {
-                    val numBuckets = transform.param as Int
-                    val hashCode = sourceValue.hashCode()
-                    val bucketValue = abs(hashCode % numBuckets)
-                    partitionData.set(index, bucketValue)
-                }
-
-                PartitionTransform.TRUNCATE -> {
-                    val stringValue = sourceValue.toString()
-                    val width = transform.param as Int
-                    partitionData.set(index, stringValue.take(width))
-                }
-
-            }
-
-        }
-
-        return partitionData
+        val partitionKey = PartitionKey(table.spec(), schema)
+        val wrapper = InternalRecordWrapper(schema.asStruct())
+        partitionKey.partition(wrapper.wrap(record))
+        return partitionKey
     }
 
-    fun buildTableWriter(table: Table, partitionData: PartitionData? = null): DataWriter<GenericRecord?> {
+    fun buildTableWriter(table: Table, partitionData: StructLike? = null): DataWriter<GenericRecord?> {
 
         val log = logger.getCtxLoggers(className, "buildTableWriter")
 
@@ -790,7 +712,7 @@ class AwsS3TablesTargetWriter(
 
     private fun buildPartitionRecordSets(tableName: String,
                                          recordsForTable: List<GenericRecord>,
-                                         table: Table): Map<PartitionData, List<GenericRecord>>? {
+                                         table: Table): Map<PartitionKey, List<GenericRecord>>? {
 
 
         val optimizePartitioning = targetConfiguration.tables.find { it.tableName == tableName }?.partitionOptimized ?: false
